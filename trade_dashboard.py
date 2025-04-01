@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 
-# -----------------🔐 PASSWORD CHECK ----------------- #
 def check_password():
     def password_entered():
-        if st.session_state["password"] == "test12345":  # 👈 CHANGE PASSWORD HERE
+        if st.session_state["password"] == "mydashboard123":
             st.session_state["authenticated"] = True
         else:
             st.session_state["authenticated"] = False
@@ -20,73 +20,93 @@ def check_password():
         return False
     else:
         return True
-# --------------------------------------------------- #
 
-# ✅ Only show app if password is correct
+@st.cache_data
+def compute_sharpe_ratio(df):
+    daily_pnl = df.groupby(df['date'].dt.date)['profit_loss'].sum()
+    daily_returns = daily_pnl.pct_change().dropna()
+    risk_free_rate = 0.02 / 252
+    if daily_returns.std() == 0:
+        return 0
+    sharpe = (daily_returns.mean() - risk_free_rate) / daily_returns.std()
+    return round(sharpe, 2)
+
+@st.cache_data
+def compute_drawdown(df):
+    cum_pnl = df['profit_loss'].cumsum()
+    peak = cum_pnl.cummax()
+    drawdown = cum_pnl - peak
+    return round(drawdown.min(), 2)
+
+@st.cache_data
+def get_top_symbols(df, symbol_col):
+    return df[symbol_col].value_counts().head(5)
+
 if check_password():
+    st.set_page_config(page_title="Trading Dashboard", layout="wide")
+    st.title("📊 Ultimate Final Trading Dashboard")
 
-    # ------------------- APP START ------------------- #
-    st.set_page_config(page_title="Trading Performance Dashboard", layout="wide")
-    st.title("📊 Compact Trading Dashboard")
-
-    uploaded_file = st.file_uploader("Upload your trade CSV", type=["csv"])
+    uploaded_file = st.file_uploader("📁 Upload trade CSV", type=["csv"])
 
     if uploaded_file:
+        start = time.time()
         df = pd.read_csv(uploaded_file)
         df.columns = df.columns.str.lower()
-        st.write("🧪 Columns found:", df.columns.tolist())
 
+        minimal_view = st.checkbox("🧹 Show minimal view (summary only)", value=False)
+
+        # -------- User filter --------
         uid_column = next((col for col in ['userid', 'useruid'] if col in df.columns), None)
         if uid_column:
-            uids = df[uid_column].dropna().unique()
+            uids = df[uid_column].dropna().unique().tolist()
             selected_uid = st.selectbox("👤 Select User ID", sorted(uids))
             df = df[df[uid_column] == selected_uid]
             st.success(f"Showing data for UID: {selected_uid}")
         else:
-            st.warning("⚠️ No valid UID column found.")
+            st.warning("⚠️ No UID column found.")
 
-        if 'profit_loss' in df.columns:
-            df['profit_loss'] = pd.to_numeric(df['profit_loss'], errors='coerce')
-        elif 'accpnl' in df.columns:
-            df['profit_loss'] = pd.to_numeric(df['accpnl'], errors='coerce')
-        elif {'entryprice', 'exitprice'}.issubset(df.columns):
-            df['profit_loss'] = pd.to_numeric(df['exitprice'], errors='coerce') - pd.to_numeric(df['entryprice'], errors='coerce')
-        else:
-            st.error("❌ No profit column found.")
-            st.stop()
+        # -------- Profit calculation --------
+        df['profit_loss'] = 0.0
+        if 'accpnl' in df.columns:
+            df['accpnl'] = pd.to_numeric(df['accpnl'], errors='coerce').fillna(0)
+            df['profit_loss'] = df['accpnl']
 
+        if {'entryprice', 'exitprice'}.issubset(df.columns):
+            df['entryprice'] = pd.to_numeric(df['entryprice'], errors='coerce')
+            df['exitprice'] = pd.to_numeric(df['exitprice'], errors='coerce')
+            calc_pnl = (df['exitprice'] - df['entryprice']).fillna(0)
+            df.loc[df['profit_loss'] == 0, 'profit_loss'] = calc_pnl[df['profit_loss'] == 0]
+
+        # -------- Date handling --------
         date_column = next((col for col in ['date', 'createtime', 'opentime', 'timestamp', 'updatetime'] if col in df.columns), None)
         if date_column:
             df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
-            df = df.dropna(subset=[date_column])
-            df = df.sort_values(by=date_column)
-            df['date'] = df[date_column]
+            df['date'] = df[date_column].fillna(pd.Timestamp("1970-01-01"))
         else:
             st.error("❌ No valid date column found.")
             st.stop()
 
-        total_profit = df['profit_loss'].sum()
-        average_pl = df['profit_loss'].mean()
-        total_trades = len(df)
-        winning_trades = len(df[df['profit_loss'] > 0])
-        losing_trades = len(df[df['profit_loss'] < 0])
+        # Separate full dataset vs chart-safe dataset
+        df_full = df.copy()
+        df = df[df['date'] > pd.Timestamp("2000-01-01")]
+
+        # -------- Metrics --------
+        total_profit = df_full['profit_loss'].sum()
+        average_pl = df_full['profit_loss'].sum() / len(df_full)
+        total_trades = len(df_full)
+        winning_trades = len(df_full[df_full['profit_loss'] > 0])
+        losing_trades = len(df_full[df_full['profit_loss'] < 0])
         win_rate = (winning_trades / total_trades * 100) if total_trades else 0
 
-        sharpe = None
-        max_dd = None
-        try:
-            daily_pnl = df.groupby(df['date'].dt.date)['profit_loss'].sum()
-            daily_returns = daily_pnl.pct_change().dropna()
-            sharpe = (daily_returns.mean() - 0.02 / 252) / daily_returns.std()
-        except: pass
+        sharpe = compute_sharpe_ratio(df)
+        max_dd = compute_drawdown(df)
 
-        try:
-            cum_pnl = df['profit_loss'].cumsum()
-            peak = cum_pnl.cummax()
-            drawdown = cum_pnl - peak
-            max_dd = drawdown.min()
-        except: pass
+        with st.expander("🧪 Debug Info", expanded=False):
+            st.write(f"📊 Rows used: {len(df_full)}")
+            st.write(f"🧮 Profit sum: {total_profit:,.2f}")
+            st.write(f"📈 Average P/L: {average_pl:,.2f}")
 
+        # -------- Performance Metrics --------
         st.subheader("📈 Performance Metrics")
         mcol1, mcol2, mcol3 = st.columns(3)
         mcol1.metric("💰 Total Profit", f"${total_profit:,.2f}")
@@ -94,85 +114,73 @@ if check_password():
         mcol3.metric("🏆 Win Rate", f"{win_rate:.2f}%")
 
         mcol4, mcol5, mcol6 = st.columns(3)
-        mcol4.metric("📈 Sharpe Ratio", f"{sharpe:.2f}" if sharpe else "N/A")
-        mcol5.metric("📉 Max Drawdown", f"${max_dd:,.2f}" if max_dd else "N/A")
+        mcol4.metric("📈 Sharpe Ratio", f"{sharpe}")
+        mcol5.metric("📉 Max Drawdown", f"${max_dd:,.2f}")
         mcol6.metric("🔢 Total Trades", total_trades)
 
-        # ========== Cumulative Profit ==========
-        st.subheader("📅 Cumulative Profit Over Time")
-        df['cumulative'] = df['profit_loss'].cumsum()
-        st.line_chart(df.set_index('date')['cumulative'])
+        if not minimal_view:
+            st.subheader("📅 Cumulative Profit Over Time")
+            df['cumulative'] = df['profit_loss'].cumsum()
+            st.line_chart(df.set_index('date')['cumulative'])
 
-        # ========== Time-Based Charts ==========
-        st.subheader("⏱️ Time-Based Profit Breakdown")
-        day_pnl = df.groupby(df['date'].dt.day_name())['profit_loss'].sum()
-        df['hour'] = df['date'].dt.hour
-        hour_pnl = df.groupby('hour')['profit_loss'].sum()
-        tcol1, tcol2 = st.columns(2)
-        with tcol1:
-            st.write("📅 Profit by Day of Week")
-            st.bar_chart(day_pnl)
-        with tcol2:
-            st.write("🕒 Profit by Hour")
-            st.bar_chart(hour_pnl)
+            st.subheader("⏱️ Time-Based Profit Breakdown")
+            day_pnl = df.groupby(df['date'].dt.day_name())['profit_loss'].sum()
+            df['hour'] = df['date'].dt.hour
+            hour_pnl = df.groupby('hour')['profit_loss'].sum()
 
-        # ========== Symbol Analysis ==========
-        symbol_col = next((col for col in ['symbol', 'pair', 'contract', 'ticker'] if col in df.columns and not pd.api.types.is_numeric_dtype(df[col])), None)
-        if symbol_col:
-            st.subheader("📊 Symbol-Based Analysis")
-            sc1, sc2 = st.columns(2)
+            tcol1, tcol2 = st.columns(2)
+            with tcol1:
+                st.write("📅 Profit by Day of Week")
+                st.bar_chart(day_pnl)
+            with tcol2:
+                st.write("🕒 Profit by Hour")
+                st.bar_chart(hour_pnl)
 
-            top_symbols = df.groupby(symbol_col)['profit_loss'].sum().sort_values(ascending=False).head(10)
-            top_counts = df[symbol_col].value_counts().head(10)
+            # -------- Symbol Charts + Pies --------
+            symbol_col = next((col for col in ['symbol', 'pair', 'contract', 'ticker'] if col in df.columns and not pd.api.types.is_numeric_dtype(df[col])), None)
 
-            with sc1:
-                st.write("💹 Profit by Symbol")
-                st.bar_chart(top_symbols)
+            if symbol_col:
+                st.subheader("📊 Symbol Performance")
 
-            with sc2:
-                st.write("📊 Trade Count by Symbol")
-                st.bar_chart(top_counts)
+                symbol_profit = df.groupby(symbol_col)['profit_loss'].sum().sort_values(ascending=False)
+                symbol_count = df[symbol_col].value_counts()
 
-            # ========== Pie Charts: Symbol Share & Long/Short ==========
-            st.subheader("🥧 Symbol & Position Share")
+                st.bar_chart(symbol_profit.head(10))
+                st.bar_chart(symbol_count.head(10))
 
-            pc1, pc2 = st.columns(2)
+                # 🔁 PIE CHARTS: Top 5 Profit & Count
+                st.subheader("🥧 Top 5 Symbol Breakdown")
+                pie1, pie2 = st.columns(2)
 
-            with pc1:
-                st.write("🔄 Top 5 Symbol Share")
-                pie_data = top_counts.head(5)
-                fig1, ax1 = plt.subplots(figsize=(4, 4))
-                ax1.pie(
-                    pie_data,
-                    labels=pie_data.index,
-                    autopct='%1.1f%%',
-                    startangle=90,
-                    labeldistance=1.1,
-                    textprops={'fontsize': 10}
-                )
-                ax1.axis('equal')
-                st.pyplot(fig1)
-
-            position_col = next((col for col in ['position', 'side', 'direction'] if col in df.columns), None)
-            if position_col:
-                with pc2:
-                    st.write("📐 Long vs Short by Symbol")
-                    available_symbols = df[symbol_col].dropna().unique()
-                    selected_symbol = st.selectbox("🔎 Select Symbol", available_symbols)
-                    df_symbol = df[df[symbol_col] == selected_symbol]
-                    pos_counts = df_symbol[position_col].value_counts()
-                    fig2, ax2 = plt.subplots(figsize=(4, 4))
-                    ax2.pie(
-                        pos_counts,
-                        labels=pos_counts.index,
+                with pie1:
+                    st.markdown("**💰 By Profit**")
+                    top_profit = symbol_profit.head(5)
+                    fig1, ax1 = plt.subplots(figsize=(3.5, 3.5))
+                    ax1.pie(
+                        top_profit,
+                        labels=top_profit.index,
                         autopct='%1.1f%%',
                         startangle=90,
-                        textprops={'fontsize': 10}
+                        textprops={'fontsize': 9}
+                    )
+                    ax1.axis('equal')
+                    st.pyplot(fig1)
+
+                with pie2:
+                    st.markdown("**📊 By Trade Count**")
+                    top_count = symbol_count.head(5)
+                    fig2, ax2 = plt.subplots(figsize=(3.5, 3.5))
+                    ax2.pie(
+                        top_count,
+                        labels=top_count.index,
+                        autopct='%1.1f%%',
+                        startangle=90,
+                        textprops={'fontsize': 9}
                     )
                     ax2.axis('equal')
                     st.pyplot(fig2)
-        else:
-            st.warning("⚠️ No valid symbol column found.")
+
+        st.write(f"⏱️ Loaded in {time.time() - start:.2f} seconds")
 
     else:
-        st.info("👆 Upload your CSV to begin.")
+        st.info("📁 Please upload your trade CSV to get started.")
