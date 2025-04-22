@@ -1,265 +1,304 @@
-# 🔐 PASSWORD PROTECTION, METRICS, PDF, FULL DASHBOARD
-
 import streamlit as st
+st.set_page_config(page_title="DarkEx Dashboard", layout="wide")
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from fpdf import FPDF
 from datetime import datetime
+from fpdf import FPDF
 import time
 
-# ---------- PASSWORD ----------
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == "mydashboard123":
-            st.session_state["authenticated"] = True
-        else:
-            st.session_state["authenticated"] = False
-    if "authenticated" not in st.session_state:
-        st.text_input("Enter password:", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["authenticated"]:
-        st.text_input("Enter password:", type="password", on_change=password_entered, key="password")
-        st.error("Incorrect password")
-        return False
-    else:
-        return True
+# ---------- PDF REPORT GENERATOR ----------
+def generate_pdf_report(user, symbol, total_profit, avg_pl, win_rate,
+                        sharpe, drawdown, trade_count, pl_ratio):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, "DarkEx Trading Performance Dashboard", ln=True, align="C")
+    pdf.ln(5)
+    pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+    pdf.cell(0, 8, f"User ID: {user}", ln=True)
+    pdf.cell(0, 8, f"Symbol: {symbol}", ln=True)
+    pdf.ln(3)
+    pdf.cell(0, 8, f"Total Profit: ${total_profit:,.2f}", ln=True)
+    pdf.cell(0, 8, f"Average P/L: ${avg_pl:,.2f}", ln=True)
+    pdf.cell(0, 8, f"Win Rate: {win_rate:.2f}%", ln=True)
+    pdf.cell(0, 8, f"Sharpe Ratio: {sharpe}", ln=True)
+    pdf.cell(0, 8, f"Max Drawdown: ${drawdown:,.2f}", ln=True)
+    pdf.cell(0, 8, f"Total Trades: {trade_count}", ln=True)
+    if pl_ratio is not None:
+        pdf.cell(0, 8, f"P/L Ratio: {pl_ratio:.2f}", ln=True)
+    return pdf.output(dest='S').encode('latin1')
 
-# ---------- METRICS ----------
+
+# ---------- METRIC CALCULATORS ----------
 @st.cache_data
 def compute_sharpe_ratio(df):
     daily_pnl = df.groupby(df['date'].dt.date)['profit_loss'].sum()
-    daily_returns = daily_pnl.pct_change().dropna()
+    daily_ret = daily_pnl.pct_change().dropna()
     risk_free = 0.02 / 252
-    return round((daily_returns.mean() - risk_free) / daily_returns.std(), 2) if daily_returns.std() != 0 else 0
+    if daily_ret.std() == 0:
+        return 0
+    return round((daily_ret.mean() - risk_free) / daily_ret.std(), 2)
 
 @st.cache_data
 def compute_drawdown(df):
     cum_pnl = df['profit_loss'].cumsum()
-    peak = cum_pnl.cummax()
-    drawdown = cum_pnl - peak
-    return round(drawdown.min(), 2)
+    peak    = cum_pnl.cummax()
+    dd      = cum_pnl - peak
+    return round(dd.min(), 2)
 
 def compute_pl_ratio(df):
-    winners = df[df['profit_loss'] > 0]['profit_loss']
-    losers = df[df['profit_loss'] < 0]['profit_loss']
-    if not winners.empty and not losers.empty:
-        return round(winners.mean() / abs(losers.mean()), 2)
-    return None
+    wins = df.loc[df['profit_loss'] > 0, 'profit_loss']
+    loss = df.loc[df['profit_loss'] < 0, 'profit_loss']
+    if wins.empty or loss.empty:
+        return None
+    return round(wins.mean() / abs(loss.mean()), 2)
 
-# ---------- PDF GENERATION ----------
-def generate_pdf_report(user, symbol, total_profit, avg_pl, win_rate, sharpe, drawdown, trade_count, pl_ratio):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt="DarkEx Trading Performance Dashboard", ln=True, align="C")
-    pdf.ln(10)
-    pdf.cell(200, 10, txt=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
-    pdf.cell(200, 10, txt=f"User ID: {user}", ln=True)
-    pdf.cell(200, 10, txt=f"Symbol: {symbol}", ln=True)
-    pdf.ln(5)
-    pdf.cell(200, 10, txt=f"Total Profit: ${total_profit:,.2f}", ln=True)
-    pdf.cell(200, 10, txt=f"Average P/L: ${avg_pl:,.2f}", ln=True)
-    pdf.cell(200, 10, txt=f"Win Rate: {win_rate:.2f}%", ln=True)
-    pdf.cell(200, 10, txt=f"Sharpe Ratio: {sharpe}", ln=True)
-    pdf.cell(200, 10, txt=f"Max Drawdown: ${drawdown:,.2f}", ln=True)
-    pdf.cell(200, 10, txt=f"Total Trades: {trade_count}", ln=True)
-    if pl_ratio is not None:
-        pdf.cell(200, 10, txt=f"P/L Ratio: {pl_ratio:.2f}", ln=True)
-    return pdf.output(dest='S').encode('latin1')
+
+# ---------- BENCHMARK SCORING ----------
+def min_max_norm(val, lo, hi):
+    if hi == lo:
+        return 0
+    return (val - lo) / (hi - lo)
+
+def calculate_benchmark_score(df):
+    n = len(df)
+    if n == 0:
+        return {}, 0
+
+    win_rate     = df['profit_loss'].gt(0).sum() / n
+    pl_ratio     = compute_pl_ratio(df) or 0
+    pnl_vol      = df['profit_loss'].std()
+    duration_h   = (df['date'].max() - df['date'].min()).total_seconds() / 3600 + 1
+    freq         = n / duration_h
+
+    if {'entryprice','exitprice'}.issubset(df.columns):
+        e = pd.to_numeric(df['entryprice'], errors='coerce').abs()
+        x = pd.to_numeric(df['exitprice'],  errors='coerce').abs()
+        df['trade_size'] = e + x
+        avg_size = df['trade_size'].mean()
+    else:
+        avg_size = 0
+
+    ref = {
+        'win_rate':        {'min':0, '95th':0.65},
+        'pl_ratio':        {'min':0, '95th':1.0},
+        'avg_trade_size':  {'min':0, '95th':30000},
+        'pnl_volatility':  {'min':0, '95th':5000},
+        'trade_frequency': {'min':0, '95th':10},
+    }
+
+    def norm(x, metric):
+        lo, hi = ref[metric]['min'], ref[metric]['95th']
+        return round(min_max_norm(min(x, hi), lo, hi), 3)
+
+    normd = {
+        'win_rate_norm':       norm(win_rate,        'win_rate'),
+        'pl_ratio_norm':       norm(pl_ratio,        'pl_ratio'),
+        'avg_trade_size_norm': norm(avg_size,        'avg_trade_size'),
+        'pnl_volatility_norm': norm(pnl_vol,         'pnl_volatility'),
+        'trade_frequency_norm':norm(freq,            'trade_frequency'),
+    }
+
+    weights = {
+        'win_rate_norm':        0.1127,
+        'pl_ratio_norm':        0.1756,
+        'avg_trade_size_norm':  0.2629,
+        'pnl_volatility_norm':  0.2700,
+        'trade_frequency_norm': 0.1789,
+    }
+
+    score = round(sum(normd[k] * weights[k] for k in weights), 3)
+    label = 'Monitor' if score < 0.33 else 'Hold' if score < 0.66 else 'Transmit'
+
+    normd.update({'benchmark_score': score, 'risk_label': label})
+    return normd, score
+
+
+# ---------- PASSWORD PROTECTION ----------
+def check_password():
+    def _enter():
+        st.session_state.auth = (st.session_state.pw == "mydashboard123")
+    if 'auth' not in st.session_state:
+        st.text_input("Enter password:", type="password", key='pw', on_change=_enter)
+        return False
+    if not st.session_state.auth:
+        st.text_input("Enter password:", type="password", key='pw', on_change=_enter)
+        st.error("Incorrect password")
+        return False
+    return True
+
 
 # ---------- MAIN APP ----------
 if check_password():
-    st.set_page_config(page_title="DarkEx Dashboard", layout="wide")
     st.title("DarkEx Trading Performance Dashboard")
+    uploaded = st.file_uploader("Upload your trades CSV", type="csv")
+    if not uploaded:
+        st.info("Please upload a CSV to proceed.")
+        st.stop()
 
-    uploaded_file = st.file_uploader("\U0001F4C1 Upload CSV", type=["csv"])
-    if uploaded_file:
-        start = time.time()
-        df = pd.read_csv(uploaded_file)
-        df.columns = df.columns.str.lower()
+    t0 = time.time()
+    df = pd.read_csv(uploaded)
+    df.columns = df.columns.str.lower()
 
-        minimal_view = st.checkbox("Show minimal view (summary only)", value=False)
+    # Profit/Loss calculation
+    df['profit_loss'] = 0.0
+    if 'accpnl' in df.columns:
+        df['profit_loss'] = pd.to_numeric(df['accpnl'], errors='coerce').fillna(0)
+    if {'entryprice','exitprice'}.issubset(df.columns):
+        e = pd.to_numeric(df['entryprice'], errors='coerce')
+        x = pd.to_numeric(df['exitprice'],  errors='coerce')
+        fb = (x - e).fillna(0)
+        df.loc[df['profit_loss']==0, 'profit_loss'] = fb[df['profit_loss']==0]
 
-        if 'contract' in df.columns:
-            df['contract'] = df['contract'].astype(str)
-
-        uid_column = next((col for col in ['userid', 'useruid'] if col in df.columns), None)
-        if uid_column:
-            uids = sorted(df[uid_column].dropna().unique().tolist())
-            selected_uid = st.selectbox("Select User ID", ["All Customers"] + uids)
-            if selected_uid != "All Customers":
-                df = df[df[uid_column] == selected_uid]
-                st.success(f"Showing data for UID: {selected_uid}")
-            else:
-                st.info("Showing performance for ALL customers (metrics only)")
-        else:
-            st.warning("No UID column found.")
-            st.stop()
-
-        df['profit_loss'] = 0.0
-        if 'accpnl' in df.columns:
-            df['profit_loss'] = pd.to_numeric(df['accpnl'], errors='coerce').fillna(0)
-        if {'entryprice', 'exitprice'}.issubset(df.columns):
-            df['entryprice'] = pd.to_numeric(df['entryprice'], errors='coerce')
-            df['exitprice'] = pd.to_numeric(df['exitprice'], errors='coerce')
-            fallback = (df['exitprice'] - df['entryprice']).fillna(0)
-            df.loc[df['profit_loss'] == 0, 'profit_loss'] = fallback[df['profit_loss'] == 0]
-
-        if {'creattime', 'updatetime'}.issubset(df.columns):
-            df['creattime'] = pd.to_datetime(df['creattime'], errors='coerce')
-            df['updatetime'] = pd.to_datetime(df['updatetime'], errors='coerce')
-            df['holding_time'] = (df['updatetime'] - df['creattime']).dt.total_seconds() / 60
-        else:
-            df['holding_time'] = np.nan
-
-        date_column = next((col for col in ['date', 'creattime', 'timestamp', 'updatetime'] if col in df.columns), None)
-        df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
-        df['date'] = df[date_column].fillna(pd.Timestamp("1970-01-01"))
-
-        st.subheader("\U0001F4C5 Filter by Date")
-        start_date, end_date = st.date_input("Select date range", value=[df['date'].min(), df['date'].max()])
-        df = df[(df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_date))]
-
-        st.info(f"Showing trades from **{start_date}** to **{end_date}** — Total trades: **{len(df)}**")
-
-        symbol_col = 'contract'
-        symbols = df[symbol_col].dropna().unique().tolist()
-        selected_symbol = st.selectbox("Select Symbol", ["All Symbols"] + sorted(symbols))
-        if selected_symbol != "All Symbols":
-            df = df[df[symbol_col] == selected_symbol]
-            st.success(f"Filtered by Symbol: {selected_symbol}")
-        else:
-            selected_symbol = "All Symbols"
-
-        if 'leverage' in df.columns:
-            df['leverage'] = pd.to_numeric(df['leverage'], errors='coerce')
-        else:
-            df['leverage'] = np.nan
-
-        avg_leverage = df['leverage'].dropna().mean()
-        avg_holding = df['holding_time'].dropna().mean()
-        pl_ratio = compute_pl_ratio(df)
-
-        df_full = df.copy()
-        df = df[df['date'] > pd.Timestamp("2000-01-01")]
-
-        total_profit = df_full['profit_loss'].sum()
-        average_pl = df_full['profit_loss'].mean()
-        total_trades = len(df_full)
-        win_rate = (df_full['profit_loss'] > 0).sum() / total_trades * 100 if total_trades else 0
-        sharpe = compute_sharpe_ratio(df)
-        drawdown = compute_drawdown(df)
-
-        st.subheader("\U0001F4C8 Performance Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("\U0001F4B0 Total Profit", f"${total_profit:,.2f}")
-        col2.metric("\U0001F4CA Average P/L", f"${average_pl:,.2f}")
-        col3.metric("\U0001F3C6 Win Rate", f"{win_rate:.2f}%")
-        col4, col5, col6 = st.columns(3)
-        col4.metric("\U0001F4C8 Sharpe Ratio", f"{sharpe}")
-        col5.metric("\U0001F4C9 Max Drawdown", f"${drawdown:,.2f}")
-        col6.metric("\U0001F522 Total Trades", total_trades)
-        if not pd.isna(avg_leverage):
-            st.metric("\U0001F4CF Avg Leverage", f"{avg_leverage:.2f}x")
-        if not pd.isna(avg_holding):
-            st.metric("⏱️ Avg Holding Time", f"{avg_holding:.1f} min")
-        if pl_ratio is not None:
-            st.metric("⚖️ P/L Ratio", f"{pl_ratio:.2f}")
-
-        # ✅ Leaderboard (restored)
-        if selected_uid == "All Customers" and uid_column:
-            st.subheader("\U0001F3C6 Top Customers Leaderboard")
-            leaderboard = df_full.groupby(df_full[uid_column]).agg(
-                Total_Profit=('profit_loss', 'sum'),
-                Total_Trades=('profit_loss', 'count'),
-                Win_Rate=('profit_loss', lambda x: (x > 0).sum() / len(x) * 100)
-            ).sort_values(by='Total_Profit', ascending=False)
-            st.dataframe(leaderboard.head(20))
-
-        # ✅ Graphs restored
-        if selected_uid != "All Customers" and not minimal_view:
-            tab1, tab2, tab3 = st.tabs(["\U0001F4C8 Summary", "\U0001F551 Time Analysis", "\U0001F967 Symbol Breakdown"])
-            with tab1:
-                st.subheader("Cumulative Profit Over Time")
-                df['cumulative'] = df['profit_loss'].cumsum()
-                chart_df = df.set_index('date')[['cumulative']].resample('1H').mean().dropna()
-                chart_df['cumulative'] = chart_df['cumulative'].ffill()
-                st.line_chart(chart_df['cumulative'])
-            with tab2:
-                st.subheader("Profit by Day & Hour")
-                col_day, col_hour = st.columns(2)
-                with col_day:
-                    day_pnl = df.groupby(df['date'].dt.day_name())['profit_loss'].sum()
-                    st.bar_chart(day_pnl)
-                with col_hour:
-                    df['hour'] = df['date'].dt.hour
-                    hour_pnl = df.groupby('hour')['profit_loss'].sum()
-                    st.bar_chart(hour_pnl)
-            with tab3:
-                st.subheader("Symbol Performance")
-                symbol_profit = df.groupby(symbol_col)['profit_loss'].sum().sort_values(ascending=False)
-                symbol_count = df[symbol_col].value_counts()
-                chart_col1, chart_col2 = st.columns(2)
-                with chart_col1:
-                    st.markdown("### \U0001F4B0 Profit by Symbol")
-                    fig1, ax1 = plt.subplots(figsize=(5, 3))
-                    symbol_profit.head(10).plot(kind='barh', ax=ax1, color='skyblue')
-                    ax1.set_xlabel("Profit")
-                    ax1.invert_yaxis()
-                    st.pyplot(fig1)
-                with chart_col2:
-                    st.markdown("### \U0001F4CA Trade Count by Symbol")
-                    fig2, ax2 = plt.subplots(figsize=(5, 3))
-                    symbol_count.head(10).plot(kind='barh', ax=ax2, color='lightgreen')
-                    ax2.set_xlabel("Trades")
-                    ax2.invert_yaxis()
-                    st.pyplot(fig2)
-                st.subheader("Top 5 Symbol Breakdown")
-                pie1, pie2 = st.columns(2)
-                with pie1:
-                    top_profit = symbol_profit[symbol_profit > 0].head(5)
-                    if len(top_profit) > 1:
-                        fig3, ax3 = plt.subplots(figsize=(3.5, 3.5))
-                        ax3.pie(top_profit, labels=top_profit.index, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 9})
-                        ax3.axis('equal')
-                        st.pyplot(fig3)
-                    elif len(top_profit) == 1:
-                        st.info(f"Only one profitable symbol: {top_profit.index[0]}")
-                    else:
-                        st.warning("No profitable symbols to display.")
-                with pie2:
-                    top_count = symbol_count.head(5)
-                    if len(top_count) > 1:
-                        fig4, ax4 = plt.subplots(figsize=(3.5, 3.5))
-                        ax4.pie(top_count, labels=top_count.index, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 9})
-                        ax4.axis('equal')
-                        st.pyplot(fig4)
-                    elif len(top_count) == 1:
-                        st.info(f"Only one traded symbol: {top_count.index[0]}")
-                    else:
-                        st.warning("No trades to show.")
-
-        if selected_uid != "All Customers":
-            st.subheader("\U0001F4E5 Download PDF Report")
-            pdf_bytes = generate_pdf_report(
-                user=selected_uid,
-                symbol=selected_symbol,
-                total_profit=total_profit,
-                avg_pl=average_pl,
-                win_rate=win_rate,
-                sharpe=sharpe,
-                drawdown=drawdown,
-                trade_count=total_trades,
-                pl_ratio=pl_ratio
-            )
-            st.download_button(
-                label="⬇️ Download PDF Summary",
-                data=pdf_bytes,
-                file_name=f"{selected_uid}_{selected_symbol}_report.pdf".replace(" ", "_"),
-                mime="application/pdf"
-            )
-
-        st.write(f"⏱️ Loaded in {time.time() - start:.2f} seconds")
+    # Date & holding
+    for c in ['createtime','updatetime','timestamp','date']:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors='coerce')
+    df['date'] = df.filter(['createtime','timestamp','updatetime','date']).bfill(axis=1).iloc[:,0]
+    df.dropna(subset=['date'], inplace=True)
+    if {'createtime','updatetime'}.issubset(df.columns):
+        df['holding'] = (df['updatetime'] - df['createtime']).dt.total_seconds()/60
     else:
-        st.info("\U0001F4C1 Upload your trade CSV to begin.")
+        df['holding'] = np.nan
+
+    # Filters
+    st.subheader("Filter by Date & Symbol")
+    lo, hi = df['date'].min().date(), df['date'].max().date()
+    start_date, end_date = st.date_input("Date range", value=(lo,hi), min_value=lo, max_value=hi)
+    df = df[(df['date'].dt.date >= start_date) & (df['date'].dt.date <= end_date)]
+
+    if 'contract' in df.columns:
+        syms = df['contract'].dropna().unique().tolist()
+        sel = st.selectbox("Symbol", ["All"]+sorted(syms))
+        if sel != "All":
+            df = df[df['contract']==sel]
+    else:
+        sel = "All"
+
+    # Customer selector
+    uidc = next((c for c in ['userid','useruid'] if c in df.columns), None)
+    if uidc:
+        uids = sorted(df[uidc].dropna().unique())
+        choice = st.selectbox("Customer", ["All"]+uids)
+        if choice != "All":
+            df = df[df[uidc]==choice]
+    else:
+        st.warning("No UID column found.")
+        st.stop()
+
+    tfull = df.copy()
+    total_trades = len(tfull)
+    tot_profit   = tfull['profit_loss'].sum()
+    avg_pl       = tfull['profit_loss'].mean()
+    win_rate     = tfull['profit_loss'].gt(0).mean()*100 if total_trades else 0
+    sharpe       = compute_sharpe_ratio(df)
+    drawdown     = compute_drawdown(df)
+    pl_ratio     = compute_pl_ratio(df)
+    avg_lev      = tfull.get('leverage', np.nan).mean()
+    avg_hold     = tfull['holding'].mean()
+
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["📊 Performance", "📈 Benchmark Risk", "⏰ Symbol/Time"])
+    with tab1:
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Total Profit", f"${tot_profit:,.2f}")
+        c2.metric("Average P/L", f"${avg_pl:,.2f}")
+        c3.metric("Win Rate", f"{win_rate:.2f}%")
+        d1,d2,d3 = st.columns(3)
+        d1.metric("Sharpe Ratio", f"{sharpe}")
+        d2.metric("Max Drawdown", f"${drawdown:,.2f}")
+        d3.metric("Total Trades", total_trades)
+        if not np.isnan(avg_lev):
+            st.metric("Avg Leverage", f"{avg_lev:.2f}x")
+        if not np.isnan(avg_hold):
+            st.metric("Avg Hold Time", f"{avg_hold:.1f} min")
+        if pl_ratio is not None:
+            st.metric("P/L Ratio", f"{pl_ratio:.2f}")
+
+        # Leaderboard
+        if choice == "All":
+            st.subheader("🏅 Top Customers Leaderboard")
+            lb = tfull.groupby(uidc).apply(lambda g: pd.Series({
+                'Total_Profit':   g['profit_loss'].sum(),
+                'Total_Trades':   len(g),
+                'Win_Rate':       g['profit_loss'].gt(0).mean()*100,
+                'Avg_PL':         g['profit_loss'].mean(),
+                'Sharpe_Ratio':   compute_sharpe_ratio(g)
+            }))
+            lb = lb.sort_values('Total_Profit', ascending=False).head(20)
+            lb['Win_Rate']       = lb['Win_Rate'].round(2)
+            lb['Avg_PL']         = lb['Avg_PL'].round(2)
+            lb['Sharpe_Ratio']   = lb['Sharpe_Ratio'].round(2)
+            st.dataframe(lb)
+
+        if total_trades:
+            st.subheader("Cumulative P/L Over Time")
+            df['cum'] = df['profit_loss'].cumsum()
+            chart = df.set_index('date')['cum'].resample('1H').mean().ffill()
+            st.line_chart(chart)
+
+    with tab2:
+        st.subheader("Customer Risk Benchmark Scoring")
+        norm, sc = calculate_benchmark_score(tfull)
+        if norm:
+            st.markdown(f"**Benchmark Score:** `{norm['benchmark_score']}`")
+            st.markdown(f"**Risk Label:** `{norm['risk_label']}`")
+            st.dataframe(pd.DataFrame(norm, index=["Value"]).T, use_container_width=True)
+        else:
+            st.warning("No trades to score.")
+
+    with tab3:
+        st.subheader("Profit by Day & Hour")
+        dcol, hcol = st.columns(2)
+        with dcol:
+            dayp = df.groupby(df['date'].dt.day_name())['profit_loss'].sum()
+            order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            st.bar_chart(dayp.reindex(order))
+        with hcol:
+            df['hour'] = df['date'].dt.hour
+            hrp = df.groupby('hour')['profit_loss'].sum()
+            st.bar_chart(hrp)
+
+        st.subheader("Symbol Breakdown")
+        symp = df.groupby('contract')['profit_loss'].sum().sort_values(ascending=False)
+        symc = df['contract'].value_counts()
+        ca, cb = st.columns(2)
+        with ca:
+            fig, ax = plt.subplots()
+            symp.head(10).plot.barh(ax=ax)
+            ax.invert_yaxis()
+            st.pyplot(fig)
+        with cb:
+            fig, ax = plt.subplots()
+            symc.head(10).plot.barh(ax=ax)
+            ax.invert_yaxis()
+            st.pyplot(fig)
+
+        st.subheader("Top 5 Pie Charts")
+        p1, p2 = st.columns(2)
+        with p1:
+            top5 = symp[symp>0].head(5)
+            if len(top5) > 1:
+                fig, ax = plt.subplots()
+                ax.pie(top5, labels=top5.index, autopct='%1.1f%%')
+                ax.axis('equal')
+                st.pyplot(fig)
+        with p2:
+            topc = symc.head(5)
+            if len(topc) > 1:
+                fig, ax = plt.subplots()
+                ax.pie(topc, labels=topc.index, autopct='%1.1f%%')
+                ax.axis('equal')
+                st.pyplot(fig)
+
+    # PDF download
+    if choice != "All":
+        pdf_data = generate_pdf_report(
+            choice, sel, tot_profit, avg_pl, win_rate,
+            sharpe, drawdown, total_trades, pl_ratio
+        )
+        st.download_button("⬇️ Download PDF Report", pdf_data,
+                           f"{choice}_{sel}_report.pdf", "application/pdf")
+
+    st.write(f"⏱️ Loaded in {time.time() - t0:.2f} seconds")
